@@ -1,0 +1,37 @@
+
+secret:
+  access_key_secret:
+    type: aws_secrets_manager
+    secret_id: "${access_key_secret_id}"
+    region: "${aws_region}"
+
+sources:
+  firehose:
+    type: aws_kinesis_firehose  # Khai báo kiểu nguồn dữ liệu mà Vector sẽ lắng nghe
+    address: "0.0.0.0:8888"   # Địa chỉ mạng và cổng mà Vector service sẽ mở ra để lắng nghe các gói tin HTTP gửi đến từ bên ngoài (cụ thể ở đây là từ Network Load Balancer - NLB của AWS).
+    access_key: "SECRET[access_key_secret.access_key]"
+    store_access_key: false # Cấu hình bảo mật yêu cầu Vector không được lưu trữ (persist) hay ghi log lại giá trị của Access Key này xuống ổ đĩa hay màn hình console
+    common_attributes:
+      - "trongpq-source-system"
+
+
+# đóng gói toàn bộ các metric và chuyển đi lưu trữ.
+sinks: # Khối định nghĩa nơi Vector sẽ xuất dữ liệu ra sau khi đã xử lý xong
+  debug:
+    type: console
+    inputs: ["firehose"]
+    encoding:
+      codec: json
+
+  amp:
+    type: prometheus_remote_write # Đây là giao thức chuẩn công nghiệp để truyền tải dữ liệu metric (Prometheus Remote Write). 
+                                  # Nó cho phép Vector đẩy dữ liệu dồn dập, hiệu năng cao về các hệ thống lưu trữ tương thích với Prometheus
+    inputs:
+      - chromeleon_metrics_http_requests
+      - chromeleon_metrics_http_duration
+      - chromeleon_metrics_sdk_commands
+      - chromeleon_metrics_sdk_exits
+      - chromeleon_metrics_errors
+    endpoint: "http://localhost:8005${amp_remote_write_path}"
+    healthcheck:
+      enabled: false

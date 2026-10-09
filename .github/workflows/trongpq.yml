@@ -1,0 +1,88 @@
+name: trongpq
+
+on:
+  workflow_dispatch:
+  # push:
+  #   paths:
+  #     - core/**
+  #     - collectors/**
+  #     - .github/workflows/trongpq.yml
+  #     - .github/workflows/shared-terraform.yml
+  #   # kích hoạt khi push lên có sự thay đổi của các file trong thư mục core, collectors hoặc các file workflow liên quan đến terraform
+  # schedule:
+  #   # Lên lịch chạy tự động theo thời gian
+  #   - cron: "0 6 * * *" 
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  core-qa:
+    name: core-qa
+    strategy:
+      matrix:
+        region:
+          - eu-central-1
+    uses: ./.github/workflows/shared-terraform.yml
+    with:
+      deployment_path: core/deployment
+      target_environment: trongpq-qa
+      target_region: ${{ matrix.region }}
+    permissions:
+      id-token: write
+      contents: read
+
+  collector-qa:
+    name: collector-qa
+    needs: core-qa
+    strategy:
+      matrix:
+        region:
+          - eu-central-1
+    uses: ./.github/workflows/shared-terraform.yml
+    with:
+      deployment_path: collectors/deployment
+      target_environment: trongpq-qa
+      target_region: ${{ matrix.region }}
+    permissions:
+      id-token: write
+      contents: read
+
+  # core-prod:
+  #   name: core-prod
+  #   # Chỉ cho phép job này chạy khi code được push hoặc merge trực tiếp vào nhánh chính main.
+  #   # Hoặc cho phép chạy khi bạn tạo một Tag phiên bản mới (ví dụ: các thẻ như v1.0.0, v2.1.0 để phát hành bản release chính thức).
+  #   if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+  #   # github.ref là một biến môi trường có sẵn (default environment variable) do GitHub Actions tự động cung cấp cho mọi workflow.
+  #   #      chứa chuỗi đường dẫn (reference path) định danh nguồn gốc hoặc đối tượng đã kích hoạt workflow chạy tại thời điểm đó.
+
+  #   # chỉ được phép bắt đầu chạy sau khi job collector-qa đã chạy xong và thành công.
+  #   needs: collector-qa
+  #   strategy:
+  #     matrix:
+  #       region:
+  #         - eu-central-1
+  #   uses: ./.github/workflows/shared-terraform.yml
+  #   with:
+  #     deployment_path: core/deployment
+  #     target_environment: trongpq-prod
+  #     target_region: ${{ matrix.region }}
+  #   permissions:
+  #     id-token: write
+  #     contents: read
+
+  # collector-prod:
+    # name: collector-prod
+    # needs: core-prod
+    # strategy:
+    #   matrix:
+    #     region:
+    #       - eu-central-1
+    # uses: ./.github/workflows/shared-terraform.yml
+    # with:
+    #   deployment_path: collectors/deployment
+    #   target_environment: trongpq-prod
+    #   target_region: ${{ matrix.region }}
+    # permissions:
+    #   id-token: write
+    #   contents: read

@@ -1,0 +1,123 @@
+name: terraform
+# only run on manual invocation
+on:
+  workflow_call:
+    inputs:
+      deployment_path:
+        type: string
+        required: true
+      terraform_version:
+        type: string
+        required: false
+        default: 1.10.5
+      terraform_debug:
+        type: boolean
+        required: false
+        default: false
+      target_environment:
+        type: string
+        required: true
+      target_region:
+        type: string
+        required: true
+      approval_required:
+        type: boolean
+        required: false
+        default: false
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform
+    defaults:
+      run:
+        shell: bash 
+        # Nó ra lệnh cho GitHub Actions biết rằng các câu lệnh bên trong phần run: phải được thực thi bằng trình thông dịch dòng lệnh Bash
+        working-directory: ${{ inputs.deployment_path }}
+        # Tự động chuyển toàn bộ các lệnh chạy tiếp theo vào thư mục được truyền từ tham số đầu vào (inputs.deployment_path), giúp bạn không phải gõ lệnh cd thủ công ở mỗi step.
+    environment:
+      name: ${{ inputs.target_environment }}
+    runs-on: ${{ vars.PIPELINE_IMAGE }}   # chứa đường dẫn đến Docker Image - máy chạy CICD
+
+    steps:
+      - name: git_checkout  # Kéo mã nguồn từ Repository về máy chủ chạy.
+        uses: actions/checkout@v6
+
+      - name: check_lockfile
+        # : Kiểm tra xem file .terraform.lock.hcl có tồn tại không
+        #  Tránh việc tự động tải các phiên bản Provider mới nhất trên internet về, dễ dẫn đến việc xung đột phiên bản hoặc lỗi bất ngờ
+        run: |
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::error title=Missing Terraform dependency lockfile::lockfile not found at ${{ inputs.deployment_path }}/.terraform.lock.hcl"
+            exit 1
+          fi
+    
+      - name: assume_role
+        # Sử dụng cơ chế OIDC (đã bàn ở phần permissions trước) để xin quyền truy cập tạm thời vào tài khoản AWS (role-to-assume) mà không cần lộ Secret Key.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+            role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+            aws-region: ${{ inputs.target_region }}
+            audience: "sts.amazonaws.com"
+      
+        # Cài đặt phiên bản Terraform đúng chuẩn và lưu cache (cache providers) lại để các lần chạy sau không phải mất thời gian tải lại từ internet, giúp pipeline chạy nhanh hơn đáng kể.
+      - name: install_terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+        # Terraform sẽ đọc file .terraform.lock.hcl để xem bạn cần những provider nào, sau đó tải các tệp thực thi của provider đó về máy chủ chạy CI/CD.
+        # Các gói provider của AWS hay Grafana có dung lượng khá lớn. Nếu không cache, mỗi lần pipeline chạy (hoặc mỗi khi có job mới được gọi), máy chủ 
+        # ảo của GitHub sẽ mất từ 30 giây đến vài phút chỉ để tải lại từ đầu các gói này qua internet. Khi có cache, nó chỉ mất chưa đầy 1 giây để khôi phục lại từ ổ cứng cục bộ.
+      - name: cache_terraform
+        uses: actions/cache@v5
+        with:
+          path: ${{ inputs.deployment_path }}/.terraform/providers/
+          key: ${{ runner.os }}-terraform-${{ inputs.terraform_version }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', inputs.deployment_path)) }}
+    
+        # kiểm tra xem tham số terraform_debug có được bật (true) hay không. Nếu có, nó sẽ tiêm biến môi trường TF_LOG=debug vào hệ thống ($GITHUB_ENV).
+      - name: enable_debug
+        run: echo TF_LOG=debug >> $GITHUB_ENV
+        if: ${{ inputs.terraform_debug == true }}
+
+      - name: terraform init
+        run: >
+          terraform init
+          -backend-config='bucket=${{ vars.TF_STATE_BUCKET_PREFIX }}${{ inputs.target_region }}'
+          -backend-config='region=${{ inputs.target_region }}'
+          -backend-config='key=${{ inputs.deployment_path }}/terraform.tfstate'
+          -backend-config='use_lockfile=true' 
+          -input=false
+        # Kích hoạt tính năng native locking của Terraform (dùng chính S3 lockfile) để ngăn chặn việc 2 người cùng chạy apply một lúc gây xung đột state.
+
+      # The grafana provider's `auth` comes from a token managed in this same
+      # config (module.observability). If that token is ever replaced in the
+      # same apply that also touches grafana_data_source.amp, the new token's
+      # value isn't known until after apply -- but the provider needs it
+      # up front -- so the whole apply fails with "the Grafana client is
+      # required for this resource". Resolving the token first, on its own,
+      # avoids pulling grafana_data_source.amp (and the provider) into that
+      # narrower plan. This step is permanent, not a one-off: time_rotating
+      # will trigger a replacement here every ~25 days.
+
+      # Luôn chạy terraform apply cho module.observability.aws_grafana_workspace_service_account_token.terraform trước, 
+      # để đảm bảo token được tạo ra trước khi chạy apply cho các data source của Grafana. (nếu không, apply sẽ bị lỗi vì provider Grafana cần token để xác thực trước khi tạo data source).
+      - name: terraform_apply_grafana_token
+        if: ${{ inputs.deployment_path == 'core/deployment' }}
+        run: >
+          terraform apply
+          -auto-approve
+          -target=module.observability.aws_grafana_workspace_service_account_token.terraform
+          -var='target_environment=${{ inputs.target_environment }}'
+          -var='target_stage=${{ vars.TARGET_STAGE }}'
+          -var-file='./variables/${{ inputs.target_environment }}.tfvars'
+
+      - name: terraform_apply
+        run: >
+          terraform apply
+          -auto-approve
+          -var='target_environment=${{ inputs.target_environment }}'
+          -var='target_stage=${{ vars.TARGET_STAGE }}'
+          -var-file='./variables/${{ inputs.target_environment }}.tfvars'

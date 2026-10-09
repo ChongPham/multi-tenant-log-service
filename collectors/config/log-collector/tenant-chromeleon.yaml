@@ -1,0 +1,217 @@
+transforms:
+  chromeleon_gate:
+    type: filter
+    inputs: ["firehose"]
+    condition: '.common_attributes."trongpq-source-system" == "chromeleon"'
+
+  # Bóc tách lớp vỏ bọc (Envelope & Expand) → tách từng dòng log + Định tuyến (Route)→ phân loại log theo stream -> Chuẩn hóa và Chuyển đổi thành Metric
+
+  # đọc cấu trúc JSON
+  # Dữ liệu nhận từ source firehose có trường .message chứa chuỗi JSON. Ví dụ đơn giản hóa:
+  # "message": "{\"logGroup\":\"chromeleon\",\"logStream\":\"service-all\",\"logEvents\":[{\"message\":\"Request A\"},{\"message\":\"Request B\"}]}"
+  chromeleon_parse_envelope:
+    type: remap # 1 dạng biến đổi transform, dùng để parse JSON từ message của firehose 
+    inputs: ["chromeleon_gate"]
+    # nội dung chính của log nằm ở bên trong trường .message (dưới dạng chuỗi string thô).
+    # string!(.message): Ép kiểu dữ liệu của trường .message chắc chắn là dạng chuỗi (string)
+    # parse_json!(...): Giải mã chuỗi JSON đó ra thành các trường dữ liệu (fields) dạng đối tượng để Vector có thể đọc hiểu từng trường bên trong.
+    # . = ...: Gán ngược toàn bộ các trường vừa bóc tách được trở thành cấu trúc dữ liệu chính của sự kiện (event) hiện tại.
+    # Đổi tên trường (Rename): Lấy giá trị của logStream gán sang trường mới là log_stream (theo chuẩn snake_case), 
+    #   sau đó xóa bỏ trường cũ logStream đi để dữ liệu gọn gàng, sạch sẽ hơn trước khi đẩy đi nơi khác.
+    source: |
+      . = parse_json!(string!(.message))
+      .log_stream = del(.logStream)
+      .log_group = del(.logGroup)
+  
+  # tách thành từng event => mỗi event là 1 dòng log thực tế (lấy các field cần thiết từ logEvents)
+  chromeleon_expand_events:
+    type: lua # ngôn nhữ lập trình Lua, được Vector nhúng sẵn để xử lý dữ liệu log.
+    version: "2"
+    inputs: ["chromeleon_parse_envelope"] # Lấy kết quả đầu ra từ bước trước (parse_envelope) làm đầu vào cho khối Lua này.
+    hooks: # định nghĩa các hàm can thiệp vào luồng chạy của Vector
+      # Đầu vào: Nhận vào 1 sự kiện bự chứa một đống log gộp bên trong (logEvents).
+      # Đầu ra: Nhờ vòng lặp và hàm emit(), nó đập nát cục bự đó ra và nhả ra N sự kiện độc lập (tương ứng với N dòng log thực tế), 
+      #   giúp các bước phân tích/đẩy log ở phía sau có thể xử lý từng dòng một cách mượt mà!
+      # Tạo sự kiện mới và phát đi (emit)
+      process: |
+        function (event, emit)
+          local log_stream = event.log.log_stream or ""
+          local events = event.log.logEvents
+          if events ~= nil then
+            for _, e in ipairs(events) do
+              local new_event = {log = {message = e.message, log_stream = log_stream}}
+              emit(new_event)
+            end
+          end
+        end
+  # mẫu log tham khảo từ AWS CloudWatch Logs gửi về qua Firehose (được Vector nhận và bóc tách ở bước trên):
+  # {
+  # "messageType": "DATA_MESSAGE",
+  # "owner": "123456789012",
+  # "logGroup": "/aws/ecs/chromeleon-service",     <-- Đổi tên thành log_group
+  # "logStream": "ecs/chromeleon/a1b2c3d4",         <-- Đổi tên thành log_stream
+  # "subscriptionFilters": ["OneFilter"],
+  # "logEvents": [                                  <-- CHÍNH LA TRƯỜNG NÀY!
+  #   {
+  #     "id": "36789...",
+  #     "timestamp": 1698000000000,
+  #     "message": "2026-10-09 10:00:00 [INFO] Chromeleon task started"
+  #   },
+  #   {
+  #     "id": "36789...",
+  #     "timestamp": 1698000005000,
+  #     "message": "2026-10-09 10:00:05 [INFO] Processing batch request..."
+  #   }
+  # ]
+
+  # đưa event vào nhánh phù hợp 
+  # nhận hàng loạt sự kiện vừa được bóc tách từ bước trước (inputs: ["expand_events"]) rồi rẽ nhánh chúng đi theo các con đường khác nhau dựa vào tên của luồng log (log_stream)
+  chromeleon_route_by_stream:
+    type: route # Khai báo đây là một bộ định tuyến. Thay vì giữ mọi thứ trên một đường chạy thẳng tắp, nó cho phép chia nhỏ luồng dữ liệu thành các nhánh độc lập.
+    inputs: ["chromeleon_expand_events"]
+    route:
+      service_all: '.log_stream == "service-all"'  # Nếu sự kiện nào có .log_stream chứa giá trị bằng chính xác "service-all", nó sẽ được gom vào chiếc giỏ (nhánh) mang tên service_all.
+      sdk_commands: '.log_stream == "sdk-commands"'
+      sdk_errors: '.log_stream == "sdk-errors"'
+  
+  #=====================================================
+  # Service_All.log: HTTP request metrics
+
+  # Lọc những dòng log đủ điều kiện 
+  chromeleon_filter_http_requests:
+    type: filter # Khai báo đây là một bộ lọc sự kiện. Nó chỉ có 2 trạng thái đầu ra: Giữ lại (Keep) nếu thỏa mãn điều kiện, hoặc Vứt bỏ (Drop) nếu không thỏa mãn.
+    inputs: ["chromeleon_route_by_stream.service_all"]
+    condition: 'contains(string!(.message), "Request finished HTTP")'
+    # string!(.message): Ép nội dung của trường .message thành kiểu chuỗi.
+    # contains(..., "Request finished HTTP"): Kiểm tra xem trong chuỗi thông điệp đó có chứa chính xác cụm từ "Request finished HTTP" hay không.
+    # Nếu có, sự kiện được giữ lại để chuyển sang bước tiếp theo.
+    # Nếu không, sự kiện đó sẽ bị vứt bỏ ngay lập tức khỏi luồng xử lý.
+
+  # dùng biểu thức chính quy (Regex) để moi móc từng con số, từng thành phần (Method, Status, Thời gian thực thi, Đường dẫn URL) từ một dòng text
+  chromeleon_parse_http_requests:
+    type: remap
+    inputs: ["chromeleon_filter_http_requests"]
+    source: |
+      parsed = parse_regex!(.message, r'Request finished HTTP/\d\.\d (?P<method>\w+) (?P<url>\S+) - (?P<status>\d+) \d+ \S+ (?P<duration>[\d.]+)ms')
+      .method = parsed.method
+      .status_code = parsed.status
+      .duration_ms = to_float!(parsed.duration)
+      url_parts = split(parsed.url, "?")
+      url_path = url_parts[0]
+      path_match, err = parse_regex(url_path, r'https?://[^/]+(?P<path>/.*)')
+      if err == null {
+        .endpoint = path_match.path
+      } else {
+        .endpoint = url_path
+      }
+
+  chromeleon_metrics_http_requests:
+    type: log_to_metric # Khai báo chức năng chuyên đổi log thành metric. Thay vì giữ lại các dòng log text nặng nề mãi mãi, 
+                        # Vector sẽ tự động đếm và cộng dồn chúng thành các con số gọn nhẹ (kiểu như Prometheus metrics)
+    inputs: ["chromeleon_parse_http_requests"]
+    metrics:
+      - type: counter # một loại metric dạng Bộ đếm (Counter). Đặc tính của counter là giá trị chỉ có tăng lên (hoặc reset về 0 khi khởi động lại)
+        field: method
+        name: chromeleon_http_requests_total # Tên định danh của metric xuất ra (tuân thủ chuẩn đặt tên Prometheus với hậu tố _total cho các bộ đếm tổng số lượng).
+        tags: # linh hồn giúp metric của bạn trở nên cực kỳ mạnh mẽ nhờ các cú pháp nội suy template {{...}}
+          method: "{{method}}"
+          endpoint: "{{endpoint}}"
+          status_code: "{{status_code}}"
+
+  chromeleon_metrics_http_duration:
+    type: log_to_metric
+    inputs: ["chromeleon_parse_http_requests"]
+    metrics:
+      - type: histogram # Biểu đồ phân phối tần suất: loại metric sinh ra chuyên để đo lường các đại lượng có giá trị thay đổi liên tục như thời gian phản hồi, kích thước gói tin, v.v.
+                        # Percentile -> P95, P99 => ngon hơn trung bình nhiều
+        field: duration_ms 
+        name: chromeleon_http_duration_ms
+        tags:
+          method: "{{method}}"
+          endpoint: "{{endpoint}}"
+
+  #=====================================================
+  # SdkConsoleApp.log: SDK command + exit metrics
+  # Thay vì chỉ xử lý log HTTP thông thường, đoạn cấu hình này giúp bạn giám sát các tác vụ chạy ngầm hoặc các câu lệnh CLI/SDK bên trong ứng dụng:
+  # Biết được chính xác lệnh nào đang được gọi (.command).
+  # Theo dõi được lệnh đó chạy xong hay chưa, kết quả ra sao (.exit_code, .exit_reason).
+
+  # Chỉ giữ lại những dòng log thông báo bắt đầu thực thi lệnh
+  chromeleon_filter_sdk_executing:
+    type: filter
+    inputs: ["chromeleon_route_by_stream.sdk_commands"]
+    condition: 'contains(string!(.message), "Executing command:")'
+
+  # Dùng biểu thức chính quy để tóm lấy tên câu lệnh
+  chromeleon_parse_sdk_executing:
+    type: remap
+    inputs: ["chromeleon_filter_sdk_executing"]
+    source: |
+      parsed = parse_regex!(.message, r'Executing command: "(?P<command>\w+)"')
+      .command = parsed.command
+
+  # Lọc log kết thúc lệnh
+  chromeleon_filter_sdk_exit:
+    type: filter
+    inputs: ["chromeleon_route_by_stream.sdk_commands"]
+    condition: 'contains(string!(.message), "Creating SdkResponse with exit code")'
+
+  # (Bóc tách mã lỗi và lý do) Dùng biểu thức chính quy để tóm lấy exit code và lý do kết thúc lệnh
+  chromeleon_parse_sdk_exit:
+    type: remap
+    inputs: ["chromeleon_filter_sdk_exit"]
+    source: |
+      parsed = parse_regex!(.message, r'exit code (?P<code>\d+) \((?P<reason>\w+)\)')
+      .exit_code = parsed.code
+      .exit_reason = parsed.reason
+
+  # đếm tổng số lần các lệnh được thực thi.
+  chromeleon_metrics_sdk_commands:
+    type: log_to_metric
+    inputs: ["chromeleon_parse_sdk_executing"]
+    metrics:
+      - type: counter
+        field: command
+        name: chromeleon_sdk_commands_total
+        tags:
+          command: "{{command}}"
+
+  # bộ đếm để đếm số lượng các lần kết thúc lệnh
+  chromeleon_metrics_sdk_exits:
+    type: log_to_metric
+    inputs: ["chromeleon_parse_sdk_exit"]
+    metrics:
+      - type: counter
+        field: exit_code
+        name: chromeleon_sdk_exits_total
+        tags:
+          exit_code: "{{exit_code}}"
+          exit_reason: "{{exit_reason}}"
+  
+  # SdkConsoleApp_Error.log: error count metrics
+  chromeleon_filter_errors:
+    type: filter
+    inputs: ["chromeleon_route_by_stream.sdk_errors"]
+    condition: 'match(string!(.message), r''^\d{4}-\d{2}-\d{2}'')'
+
+  # Khối bóc tách dữ liệu
+  chromeleon_parse_errors:
+    type: remap
+    inputs: ["chromeleon_filter_errors"]
+    source: |
+      parsed = parse_regex!(.message, r'^\d{4}-\d{2}-\d{2}\s+\S+\s+\[\d+\]\s+(?P<level>\w+)\s+(?P<logger>\S+)\s+-\s+(?P<error_message>.*)')
+      .level = parsed.level
+      .logger = parsed.logger
+      .error_message = parsed.error_message
+  # Khối chuyển đổi thành Metric
+  chromeleon_metrics_errors:
+    type: log_to_metric
+    inputs: ["chromeleon_parse_errors"]
+    metrics:
+      - type: counter
+        field: level
+        name: chromeleon_errors_total
+        tags:
+          level: "{{level}}"
+          logger: "{{logger}}"
+

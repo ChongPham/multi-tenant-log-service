@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TRONGPQ log forwarding. Creates the Firehose delivery stream, both IAM
+  roles, the access-key secret, and up to 5 CloudWatch Logs subscription
+  filters described in docs/log-forwarding-instructions.md. Deploy once per
+  AWS account with the values TRONGPQ gives you, then subscribe your own log
+  group(s).
+# tự động hóa việc chuyển tiếp log (log forwarding) từ Amazon CloudWatch Logs sang hệ thống app, sử dụng dịch vụ Amazon Kinesis Data Firehose.
+# Tạo ra các tài nguyên cần thiết (Firehose Delivery Stream, IAM Roles, Secrets) và liên kết tối đa 5 CloudWatch Log Groups với hệ thống TRONGPQ.
+
+Parameters:
+  SourceSystemName: # Tên viết tắt của hệ thống
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+    ConstraintDescription: "Lowercase letters, digits, and hyphens only, starting with a letter, 2-31 characters."
+    Description: >
+      Short lowercase name for your system (e.g. chromeleon, aps, ips). Used
+      to name every resource this template creates -- must be unique per
+      account if you onboard more than one system from the same account.
+
+  TrongpqIngestionUrl: # Đường dẫn (URL) endpoint nhận log do đội ngũ TRONGPQ cung cấp
+    Type: String
+    Description: >
+      Ingestion endpoint URL provided by the TRONGPQ team. Bare https://<domain>
+      only -- no port. Firehose rejects URLs with an explicit port.
+    AllowedPattern: "^https://[^:/]+$"
+    ConstraintDescription: "Must be https://<domain> with no path, no port."
+
+  TrongpqAccessKey: # Khóa truy cập (Access Key) do TRONGPQ cung cấp để xác thực HTTP endpoint của Firehose.
+                   #        Tham số này bật tính năng NoEcho: true để ẩn/mã hóa giá trị khi hiển thị trên giao diện AWS
+    Type: String
+    NoEcho: true
+    Description: Access key provided by the TRONGPQ team, for Firehose HTTP endpoint authentication.
+
+  TrongpqBackupBucketName:  # Tên S3 bucket (đã tồn tại sẵn bên phía tài khoản TRONGPQ) dùng để chứa dữ liệu dự phòng (backup) khi Firehose gặp sự cố gửi log.
+    Type: String
+    Description: >
+      Shared Firehose backup bucket name provided by the TRONGPQ team. This
+      bucket already exists in TRONGPQ's account -- this template does not
+      create it.
+
+  # Tên các CloudWatch Log Groups hiện có của hệ thống bạn
+  LogGroupName1: # bắt buộc
+    Type: String
+    Description: >
+      Name of your existing CloudWatch Logs log group that your system writes
+      to (e.g. /chromeleon/production/logs). This template subscribes it to
+      the Firehose stream; it does not create or configure the log group
+      itself.
+
+  LogGroupName2:
+    Type: String
+    Default: ""
+    Description: Second log group to subscribe (optional -- leave blank if you only have one).
+
+  LogGroupName3:
+    Type: String
+    Default: ""
+    Description: Third log group to subscribe (optional).
+
+  LogGroupName4:
+    Type: String
+    Default: ""
+    Description: Fourth log group to subscribe (optional).
+
+  LogGroupName5:
+    Type: String
+    Default: ""
+    Description: >
+      Fifth log group to subscribe (optional). Need more than 5? Add another
+      LogGroupNameN parameter and a matching Condition + SubscriptionFilterN
+      resource below, following the same pattern.
+
+Conditions: # Phần này dùng để kiểm tra xem bạn có điền tên cho các Log Group tùy từ số 2 đến số 5 hay không
+  HasLogGroup2: !Not [!Equals [!Ref LogGroupName2, ""]]
+  HasLogGroup3: !Not [!Equals [!Ref LogGroupName3, ""]]
+  HasLogGroup4: !Not [!Equals [!Ref LogGroupName4, ""]]
+  HasLogGroup5: !Not [!Equals [!Ref LogGroupName5, ""]]
+
+Resources:
+  # --- Secret: TRONGPQ access key, used by Firehose to authenticate to Vector ---
+  # lưu trữ một cách an toàn Access Key (do đội ngũ TRONGPQ cung cấp) để sau đó dịch vụ
+  #   Kinesis Data Firehose có thể dùng khóa này xác thực khi gửi dữ liệu sang hệ thống Vector của TRONGPQ.
+  TrongpqIngestionSecret:
+    Type: AWS::SecretsManager::Secret # là loại resource trong CloudFormation, yêu cầu AWS tạo một secret trong AWS Secrets Manager
+    Properties:
+      Name: !Sub trongpq-ingestion-access-key-${SourceSystemName} # Đặt tên cho Secret trên AWS Secrets Manager.
+      Description: !Sub Access key for TRONGPQ Vector ingestion endpoint (${SourceSystemName})
+      SecretString: !Sub '{"api_key":"${TrongpqAccessKey}"}'
+      Tags:
+        - Key: project
+          Value: !Ref SourceSystemName
+
+  # tạo một IAM Role kèm theo Policy (Chính sách quyền hạn) để quy định rõ ràng dịch vụ Kinesis Data Firehose được phép làm gì và không được phép làm gì.,
+  #      bao gồm: ghi dữ liệu backup vào S3 Bucket của TRONGPQ, ghi log nội bộ của Firehose, và đọc API Key từ Secret Manager mà chúng ta vừa tạo ở bước trước.
+  FirehoseRole:
+    Type: AWS::IAM::Role # tạo IAM role
+    Properties:
+      RoleName: !Sub ${SourceSystemName}-firehose-to-trongpq
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      # aws:SourceAccount scopes assumption to Firehose streams in this account --
+      # Principal alone would let a Firehose stream in ANY AWS account assume this
+      # role (the confused-deputy problem). sts:ExternalId is deliberately not used
+      # here: it isn't tied to caller identity, so it wouldn't actually restrict
+      # who can assume the role.
+      Tags:
+        - Key: project
+          Value: !Ref SourceSystemName
+      Policies:
+        - PolicyName: !Sub ${SourceSystemName}-firehose-to-trongpq-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Backup  # Quyền với S3 Bucket dự phòng
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !Sub "arn:aws:s3:::${TrongpqBackupBucketName}"
+                  - !Sub "arn:aws:s3:::${TrongpqBackupBucketName}/${AWS::AccountId}/*"
+              - Sid: S3BackupListBucket   # Quyền liệt kê thư mục S3
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${TrongpqBackupBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub "${AWS::AccountId}/*"
+              - Sid: CloudWatchLogs  # Quyền ghi CloudWatch Logs nội bộ
+                                     # Cho phép dịch vụ Firehose tự tạo Log Stream và ghi lại các sự kiện log vận hành/lỗi của chính nó
+                                     # vào một CloudWatch Log Group riêng có dạng /aws/firehose/<tên-hệ-thống>-to-trongpq
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/firehose/${SourceSystemName}-to-trongpq:*"
+              - Sid: SecretsManager  # Quyền đọc Secret từ Secrets Manager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                # Pinned to the exact secret this template creates -- no wildcard
+                # needed here, unlike the manual CLI flow where the secret's ARN
+                # suffix isn't known until after creation.
+                Resource: !Ref TrongpqIngestionSecret
+
+   # --- Firehose's own delivery log group (must exist before the stream is created) ---
+
+  # Tạo một CloudWatch Log Group riêng để Firehose ghi lại các sự kiện log vận hành/lỗi của chính nó, giúp bạn dễ dàng theo dõi và gỡ lỗi khi Firehose gặp sự cố.
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/firehose/${SourceSystemName}-to-trongpq
+
+  # tạo ra đường ống chuyển tiếp dữ liệu (Kinesis Data Firehose Delivery Stream), chịu trách nhiệm nhận log, đóng gói, nén,
+  # và đẩy thẳng sang hệ thống TRONGPQ (thông qua HTTP Endpoint), đồng thời xử lý các trường hợp lỗi.
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: FirehoseLogGroup
+    Properties:
+      DeliveryStreamName: !Sub ${SourceSystemName}-to-trongpq
+      DeliveryStreamType: DirectPut # Nghĩa là luồng này nhận dữ liệu được đẩy trực tiếp vào (Direct Put) từ các nguồn
+                                    #     như CloudWatch Logs subscription filters, thay vì thông qua một Kinesis Data Stream trung gian.
+      HttpEndpointDestinationConfiguration:  # Cấu hình điểm đến HTTP Endpoint
+        EndpointConfiguration:
+          Url: !Ref TrongpqIngestionUrl
+          Name: trongpq-vector-ingestion
+        SecretsManagerConfiguration:  # Cấu hình cách Firehose tự động lấy API Key từ két sắt bảo mật
+          Enabled: true
+          SecretARN: !Ref TrongpqIngestionSecret # Lấy key từ secret này
+          RoleARN: !GetAtt FirehoseRole.Arn     # Dùng FirehoseRole để cấp quyền cho Firehose được phép đọc Secret đó.
+        BufferingHints:
+          # Firehose sẽ gom log lại cho đủ 1 MB hoặc đợi tối đa 60 giây rồi mới gửi một lần sang TRONGPQ. Điều này giúp tối ưu số lượng request mạng thay vì gửi lẻ tẻ từng dòng log.
+          SizeInMBs: 1
+          IntervalInSeconds: 60
+        RetryOptions:
+          # Firehose sẽ kiên trì thử gửi lại trong vòng 300 giây (5 phút) trước khi chính thức coi như thất bại và chuyển sang chế độ dự phòng.
+          DurationInSeconds: 300
+
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          BucketARN: !Sub "arn:aws:s3:::${TrongpqBackupBucketName}"
+          # Never actually written to by this configuration (HTTP endpoint
+          # destination, FailedDataOnly, no Lambda processor) -- required field,
+          # named to say so rather than implying it holds real data. Every
+          # failed delivery lands under ErrorOutputPrefix instead, confirmed
+          # empirically with a forced-failure test.
+          Prefix: !Sub "${AWS::AccountId}/backup/unused/"
+          ErrorOutputPrefix: !Sub "${AWS::AccountId}/backup/errors/"
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP # Nén tệp log sao lưu lại dưới dạng .gz trước khi ghi vào S3 để tiết kiệm dung lượng lưu trữ.
+
+        RoleARN: !GetAtt FirehoseRole.Arn
+        S3BackupMode: FailedDataOnly
+
+        CloudWatchLoggingOptions: # Cấu hình ghi log vận hành, ghi log vận hành vào stream
+          Enabled: true
+          LogGroupName: !Sub /aws/firehose/${SourceSystemName}-to-trongpq
+          LogStreamName: HttpEndpointDelivery
+        RequestConfiguration:
+          ContentEncoding: GZIP # Yêu cầu Firehose nén dữ liệu (dùng GZIP) trước khi gửi qua HTTP request sang TRONGPQ.
+          # Lets TRONGPQ's shared multi-tenant log collector identify which
+          # logical system a record came from, independent of which AWS
+          # account/environment sent it (one system can have several
+          # accounts -- dev/qa/prod -- all using the same SourceSystemName).
+          CommonAttributes:
+            - AttributeName: trongpq-source-system
+              AttributeValue: !Ref SourceSystemName
+
+  # --- IAM role your CloudWatch Logs subscription filter assumes to write to Firehose ---
+  # IAM Role cho phép CloudWatch Logs đẩy dữ liệu vào Firehose
+  CwToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${SourceSystemName}-cw-to-firehose
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                aws:SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      # aws:SourceArn restricts assumption to log groups in this account --
+      # without it, a CloudWatch Logs subscription filter in a different AWS
+      # account could use this role to write into your Firehose stream.
+      Tags:
+        - Key: project
+          Value: !Ref SourceSystemName
+      Policies:
+        - PolicyName: !Sub ${SourceSystemName}-cw-to-firehose-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Cho phép đẩy dữ liệu dạng từng bản ghi lẻ (PutRecord) hoặc gom nhóm thành từng lô (PutRecordBatch)
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+
+  # --- Subscribes your existing log group(s) to the Firehose stream ---
+  # CloudFormation retries on IAM eventual-consistency automatically -- no
+  # manual "sleep 10 for IAM propagation" needed here, unlike the CLI flow.
+  # LogGroupName1 is required; 2-5 are optional and only create a filter when
+  # actually filled in (Condition below).
+
+  SubscriptionFilter1:
+    # Hãy gắn bộ lọc này vào cái Log Group có tên được chỉ định ở tham số LogGroupName1.
+    # Bất cứ dòng log mới nào vừa chui vào hồ chứa này, hãy lập tức 'tóm lấy' nó và đẩy sang Firehose.
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref LogGroupName1
+      FilterName: trongpq-forwarding
+      FilterPattern: "" # không lọc bỏ cái gì cả
+      DestinationArn: !GetAtt FirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt CwToFirehoseRole.Arn
+
+  SubscriptionFilter2:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: HasLogGroup2
+    Properties:
+      LogGroupName: !Ref LogGroupName2
+      FilterName: trongpq-forwarding
+      FilterPattern: ""
+      DestinationArn: !GetAtt FirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt CwToFirehoseRole.Arn
+
+  SubscriptionFilter3:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: HasLogGroup3
+    Properties:
+      LogGroupName: !Ref LogGroupName3
+      FilterName: trongpq-forwarding
+      FilterPattern: ""
+      DestinationArn: !GetAtt FirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt CwToFirehoseRole.Arn
+
+  SubscriptionFilter4:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: HasLogGroup4
+    Properties:
+      LogGroupName: !Ref LogGroupName4
+      FilterName: trongpq-forwarding
+      FilterPattern: ""
+      DestinationArn: !GetAtt FirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt CwToFirehoseRole.Arn
+
+  SubscriptionFilter5:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: HasLogGroup5
+    Properties:
+      LogGroupName: !Ref LogGroupName5
+      FilterName: trongpq-forwarding
+      FilterPattern: ""
+      DestinationArn: !GetAtt FirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt CwToFirehoseRole.Arn
+
+# Khi template của bạn chạy xong (Deploy thành công),
+# AWS sẽ hiển thị các thông tin này ra màn hình để người quản trị (hoặc các hệ thống tự động khác) có thể nhìn thấy và sử dụng lại.
+Outputs:
+  FirehoseDeliveryStreamArn:
+  # Trả về mã định danh duy nhất (ARN) của đường ống Firehose vừa được tạo ra
+    Description: ARN of the Firehose delivery stream
+    Value: !GetAtt FirehoseDeliveryStream.Arn
+
+  SecretArn:
+  # Trả về ARN của Secret chứa API Key mà Firehose đang dùng để gọi sang hệ thống TRONGPQ.
+    Description: ARN of the access-key secret (use this to rotate the key -- see below)
+    Value: !Ref TrongpqIngestionSecret
+
+  RotationCommand:
+    Description: Command to rotate the access key without touching this stack
+    Value: !Sub >-
+      aws secretsmanager put-secret-value --secret-id ${TrongpqIngestionSecret}
+      --secret-string '{"api_key":"<NEW_KEY>"}'
