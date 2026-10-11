@@ -85,7 +85,7 @@ jobs:
       - name: terraform init
         run: >
           terraform init
-          -backend-config='bucket=${{ vars.TF_STATE_BUCKET_PREFIX }}${{ inputs.target_region }}'
+          -backend-config='bucket=${{ vars.TF_STATE_BUCKET_PREFIX }}${{ inputs.target_region }}-an'
           -backend-config='region=${{ inputs.target_region }}'
           -backend-config='key=${{ inputs.deployment_path }}/terraform.tfstate'
           -backend-config='use_lockfile=true' 
