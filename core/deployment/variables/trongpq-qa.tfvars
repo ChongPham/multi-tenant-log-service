@@ -9,5 +9,5 @@ amg_workspace_name  = "trongpq-qa"
 ci_role_arn = "arn:aws:iam::174772361218:role/CI-role"
 
 sops_kms_key_admin_arns = [
-  "arn:aws:iam::174772361218:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_TrongpqAdmin_fc244a90f0662565",
+  "arn:aws:iam::174772361218:role/aws-reserved/sso.amazonaws.com/eu-central-1/AWSReservedSSO_TrongpqAdmin_f05f1a4ac2c436b2",
 ]

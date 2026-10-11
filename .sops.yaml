@@ -1,7 +1,7 @@
 creation_rules:
   # Match both Windows backslashes and Linux/macOS forward slashes.
   - path_regex: '^core[/\\]deployment[/\\]secrets[/\\]trongpq-qa\.enc\.yaml$'
-    kms: "arn:aws:kms:eu-central-1:174772361218:key/c9431526-9da3-4570-a10b-fdc8c27702cd" # alias/trongpq-sops, trongpq-qa
+    kms: "arn:aws:kms:eu-central-1:174772361218:key/6c5ce410-13b2-4739-a748-9295794fd015" # alias/trongpq-sops, trongpq-qa
   # - path_regex: '^core[/\\]deployment[/\\]secrets[/\\]trongpq-prod\.enc\.yaml$'
     # kms: "TODO" # terraform output sops_kms_key_arn, trongpq-prod
 
